@@ -1,110 +1,193 @@
 const express = require('express');
-const ollama = require('ollama').default; // Resmi Ollama kütüphanesini içeri aktarıyoruz
+const multer = require('multer');
+const pdfParse = require('pdf-parse');
+const ollama = require('ollama').default;
 
 const app = express();
-app.use(express.json()); // Gelen JSON istek gövdelerini (body) okuyabilmek için middleware
+app.use(express.json());
 
-// 1. Sabit Doküman Havuzumuz (Knowledge Base)
-// Yapay zekanın hakkında hiçbir şey bilmediği varsayılan yerel bilgi havuzumuz.
-const documents = [
-    "JavaScript tek iş parçacıklı (single-threaded) çalışan, asenkron ve olay güdümlü bir programlama dilidir.",
-    "Docker, uygulamalarınızı konteyner adı verilen izole ortamlarda çalıştırmanızı sağlayan bir platformdur.",
-    "Node.js, JavaScript kodlarının tarayıcı dışında, sunucu tarafında da çalıştırılabilmesini sağlayan bir runtime ortamıdır.",
-    "Express.js, Node.js üzerinde minimalist ve esnek web uygulamaları ile API'ler geliştirmek için kullanılan bir frameworktür.",
-    "Kosinüs benzerliği (Cosine Similarity), iki vektör arasındaki açının kosinüsünü hesaplayarak aralarındaki yönsel benzerliği ölçer."
-];
+// Bellek tabanlı dosya yükleme ayarı
+const upload = multer({ storage: multer.memoryStorage() });
 
-// 2. Kosinüs Benzerliği (Cosine Similarity) Fonksiyonu
-// İki farklı metnin yapay zeka tarafından üretilen sayı dizilerini (vektörlerini) karşılaştırır.
+// Dinamik bellek havuzumuz
+let globalChunks = [];
+
+// Kosinüs Benzerliği Fonksiyonu
 function cosineSimilarity(vecA, vecB) {
     let dotProduct = 0.0;
     let normA = 0.0;
     let normB = 0.0;
-
     for (let i = 0; i < vecA.length; i++) {
         dotProduct += vecA[i] * vecB[i];
         normA += vecA[i] * vecA[i];
         normB += vecB[i] * vecB[i];
     }
-
-    if (normA === 0 || normB === 0) return 0; // 0'a bölünme hatasını engellemek için güvenlik önlemi
+    if (normA === 0 || normB === 0) return 0;
     return dotProduct / (Math.sqrt(normA) * Math.sqrt(normB));
 }
 
-// 3. Ana İstek Noktamız (Endpoint)
-app.post('/ask', async (req, res) => {
-    const { question } = req.body; // Kullanıcının gönderdiği soruyu alıyoruz
+// Güçlendirilmiş Chunking Fonksiyonu
+function chunkText(text, chunkSize = 500, overlap = 50) {
+    const chunks = [];
+    let i = 0;
 
-    // Eğer istekte soru yoksa kullanıcıya hata dönüyoruz
+    // Metindeki gereksiz boşlukları temizle
+    const cleanText = text.replace(/\s+/g, ' ').trim();
+
+    while (i < cleanText.length) {
+        let chunk = cleanText.substring(i, i + chunkSize);
+        chunks.push(chunk);
+        i += (chunkSize - overlap);
+    }
+    return chunks;
+}
+
+// ==========================================
+// ADIM 1: PDF YÜKLEME VE İŞLEME ENDPOINT'İ (HIZLANDIRILMIŞ)
+// ==========================================
+app.post('/upload', upload.single('file'), async (req, res) => {
+    if (!req.file) {
+        return res.status(400).json({ error: "Lütfen bir dosya yükleyin." });
+    }
+
+    try {
+        console.log(`Dosya alındı: ${req.file.originalname}`);
+
+        // A. PDF'ten metni ayıkla
+        const pdfData = await pdfParse(req.file.buffer);
+        const fullText = pdfData.text;
+
+        if (!fullText || fullText.trim().length === 0) {
+            return res.status(400).json({ error: "Yüklenen PDF'ten metin okunamadı veya PDF boş." });
+        }
+
+        // B. Metni parçala
+        const rawChunks = chunkText(fullText, 500, 50);
+        console.log(`Metin ${rawChunks.length} adet parçaya (chunk) bölündü.`);
+
+        // C. BATCH (TOPLU) EMBEDDING:
+        // Tüm chunk'ları aynı anda göndermek Ollama'yı bunaltır ("maximum pending requests exceeded").
+        // Bunun yerine chunk'ları küçük gruplar (batch) halinde işliyoruz.
+        // Her batch tamamlanmadan bir sonrakine geçmiyoruz.
+        const BATCH_SIZE = 5; // Aynı anda en fazla 5 istek gönder
+        const allResults = [];
+
+        console.log(`Embedding işlemleri ${BATCH_SIZE}'li gruplar halinde başlatılıyor...`);
+
+        for (let i = 0; i < rawChunks.length; i += BATCH_SIZE) {
+            // Mevcut batch'i al (son batch, BATCH_SIZE'dan küçük olabilir)
+            const batch = rawChunks.slice(i, i + BATCH_SIZE);
+            const batchIndex = Math.floor(i / BATCH_SIZE) + 1;
+            const totalBatches = Math.ceil(rawChunks.length / BATCH_SIZE);
+            console.log(`Batch ${batchIndex}/${totalBatches} işleniyor (${batch.length} chunk)...`);
+
+            // Bu batch'teki chunk'ları paralel gönder, batch bitmeden devam etme
+            const batchPromises = batch.map(async (chunkTextContent) => {
+                try {
+                    const embeddingResponse = await ollama.embeddings({
+                        model: 'nomic-embed-text',
+                        prompt: chunkTextContent
+                    });
+                    return {
+                        text: chunkTextContent,
+                        embedding: embeddingResponse.embedding
+                    };
+                } catch (err) {
+                    console.error("Bir chunk embed edilirken hata oluştu, atlanıyor...", err.message);
+                    return null;
+                }
+            });
+
+            // Bu batch'in tamamlanmasını bekle, sonra döngü bir sonraki batch'e geçer
+            const batchResults = await Promise.all(batchPromises);
+            allResults.push(...batchResults);
+        }
+
+        // Hatalı veya boş dönen chunk'ları filtrele
+        globalChunks = allResults.filter(item => item !== null);
+
+        console.log(`Hafıza güncellendi. Toplam aktif chunk: ${globalChunks.length}`);
+
+        res.json({
+            message: "PDF başarıyla yüklendi, parçalandı ve paralel olarak embed edildi!",
+            totalChunks: globalChunks.length
+        });
+
+    } catch (error) {
+        console.error("PDF işleme hatası:", error);
+        res.status(500).json({ error: "PDF işlenirken bir hata oluştu.", details: error.message });
+    }
+});
+
+// ==========================================
+// ADIM 2: SORU SORMA ENDPOINT'İ (GÜVENLİ HALE GETİRİLMİŞ)
+// ==========================================
+app.post('/ask', async (req, res) => {
+    const { question } = req.body;
+
+    if (globalChunks.length === 0) {
+        return res.status(400).json({ error: "Lütfen önce /upload endpoint'ini kullanarak bir PDF yükleyin." });
+    }
+
     if (!question) {
         return res.status(400).json({ error: "Lütfen 'question' parametresini gönderin." });
     }
 
     try {
-        console.log(`\nYeni Soru Geldi: "${question}"`);
+        console.log(`Soru alındı: "${question}"`);
 
-        // ADIM A: Sorunun Vektörünü (Embedding) Oluşturma
-        // Kullanıcının sorduğu soruyu alıp 'nomic-embed-text' modeline göndererek sayı dizisine çeviriyoruz.
+        // A. Sorunun vektörünü al
         const questionEmbeddingResponse = await ollama.embeddings({
             model: 'nomic-embed-text',
             prompt: question
         });
         const questionEmbedding = questionEmbeddingResponse.embedding;
 
-        // ADIM B: Dokümanları Tek Tek Vektöre Çevirme ve Kıyaslama
-        const scoredDocuments = [];
+        // B. Benzerlik skorlarını hesapla
+        const scoredChunks = globalChunks.map(chunk => {
+            const similarity = cosineSimilarity(questionEmbedding, chunk.embedding);
+            return { text: chunk.text, similarity };
+        });
 
-        for (const doc of documents) {
-            // Havuzdaki her bir dökümanı sırayla yapay zekaya gönderip sayı dizisine (embedding) çeviriyoruz.
-            const docEmbeddingResponse = await ollama.embeddings({
-                model: 'nomic-embed-text',
-                prompt: doc
-            });
-            const docEmbedding = docEmbeddingResponse.embedding;
+        // C. En yakından en uzağa sırala
+        scoredChunks.sort((a, b) => b.similarity - a.similarity);
+        const bestMatch = scoredChunks[0];
 
-            // Az önce yazdığımız matematiksel fonksiyon ile sorunun vektörü ile dökümanın vektörünü kıyaslıyoruz.
-            const similarity = cosineSimilarity(questionEmbedding, docEmbedding);
+        console.log(`En yakın chunk skor: ${bestMatch.similarity.toFixed(4)}`);
 
-            // Sonucu ve dökümanı listemize ekliyoruz
-            scoredDocuments.push({ doc, similarity });
+        // GÜVENLİK BARAJI (THRESHOLD): 
+        // Eğer en yakın dökümanın benzerliği %30'un (0.30) altındaysa, yapay zekaya alakasız bilgi vermeyelim.
+        let contextText = bestMatch.text;
+        if (bestMatch.similarity < 0.30) {
+            console.warn("Eşleşme skoru çok düşük, boş context gönderiliyor.");
+            contextText = "Bu soruyla ilgili yüklenen dökümanda hiçbir bilgi bulunmamaktadır.";
         }
 
-        // ADIM C: En Alakalı Dökümanı Bulma
-        // Benzerlik skorlarına göre listeyi büyükten küçüğe sıralıyoruz.
-        scoredDocuments.sort((a, b) => b.similarity - a.similarity);
-        const bestMatch = scoredDocuments[0]; // En yüksek skora sahip olan ilk elemanı seçiyoruz.
+        // D. Llama modeline gönder
+        const systemPrompt = `Sen yardımcı bir yapay zeka asistanısın. Sadece sana verilen aşağıdaki bağlama (Context) sadık kalarak soruyu cevapla. Eğer bağlam içinde sorunun cevabı yoksa, kendi bilgini kullanma ve kibarca 'Bu bilgi dökümanda yer almıyor' de.
+Bağlam: "${contextText}"`;
 
-        console.log(`En alakalı döküman bulundu: "${bestMatch.doc}" (Skor: ${bestMatch.similarity.toFixed(4)})`);
-
-        // ADIM D: LLM (Llama) Modelini Besleme ve Cevap Üretme
-        // Yapay zekaya bir rol biçiyoruz ve bulduğumuz en alakalı dökümanı ona "Kılavuz/Bağlam" olarak veriyoruz.
-        const systemPrompt = `Sen yardımcı bir yapay zeka asistanısın. Sadece sana verilen aşağıdaki bağlama (Context) sadık kalarak soruyu cevapla. Eğer bağlamda bilgi yoksa kendi bilgini kullanma, bilmediğini söyle.
-Bağlam: "${bestMatch.doc}"`;
-
-        // Llama modeline hem sistemi (kuralları) hem de kullanıcının asıl sorusunu gönderiyoruz.
         const chatResponse = await ollama.chat({
-            model: 'llama3.1:8b', // Eğer bilgisayarın güçlüyse 'llama3.1:8b' yazabilirsin.
+            model: 'llama3.1:8b',
             messages: [
                 { role: 'system', content: systemPrompt },
                 { role: 'user', content: question }
             ]
         });
 
-        // ADIM E: Kullanıcıya Yanıtı Dönme
         res.json({
-            question: question,
-            retrievedContext: bestMatch.doc, // Yapay zekanın bulup okuduğu döküman
-            similarityScore: bestMatch.similarity, // Matematiksel benzerlik oranı
-            answer: chatResponse.message.content // Llama'nın ürettiği anlamlı cevap
+            question,
+            retrievedContext: contextText,
+            similarityScore: bestMatch.similarity,
+            answer: chatResponse.message.content
         });
 
     } catch (error) {
-        console.error("İşlem sırasında bir hata meydana geldi:", error);
-        res.status(500).json({ error: "Sunucu içi bir hata oluştu.", details: error.message });
+        console.error("Soru cevaplama hatası:", error);
+        res.status(500).json({ error: "Soru cevaplanırken bir hata oluştu.", details: error.message });
     }
 });
 
-// Sunucumuzu 3000 portunda çalıştırıyoruz
 const PORT = 3000;
 app.listen(PORT, () => {
     console.log(`RAG Sunucusu http://localhost:${PORT} adresinde aktif!`);
