@@ -28,16 +28,20 @@ function cosineSimilarity(vecA, vecB) {
 
 // Güçlendirilmiş Chunking Fonksiyonu
 function chunkText(text, chunkSize = 500, overlap = 50) {
+    const cleanText = text.replace(/\r\n/g, '\n').trim();
+
+    // Önce "Bölüm X:" gibi başlıklara göre böl
+    const sections = cleanText.split(/(?=Bölüm \d+:)/g).filter(s => s.trim().length > 0);
+
     const chunks = [];
-    let i = 0;
-
-    // Metindeki gereksiz boşlukları temizle
-    const cleanText = text.replace(/\s+/g, ' ').trim();
-
-    while (i < cleanText.length) {
-        let chunk = cleanText.substring(i, i + chunkSize);
-        chunks.push(chunk);
-        i += (chunkSize - overlap);
+    for (const section of sections) {
+        const clean = section.replace(/\s+/g, ' ').trim();
+        let i = 0;
+        while (i < clean.length) {
+            const chunk = clean.substring(i, i + chunkSize);
+            chunks.push(chunk);
+            i += (chunkSize - overlap);
+        }
     }
     return chunks;
 }
@@ -128,44 +132,46 @@ app.post('/ask', async (req, res) => {
     if (globalChunks.length === 0) {
         return res.status(400).json({ error: "Lütfen önce /upload endpoint'ini kullanarak bir PDF yükleyin." });
     }
-
     if (!question) {
         return res.status(400).json({ error: "Lütfen 'question' parametresini gönderin." });
     }
 
     try {
-        console.log(`Soru alındı: "${question}"`);
-
-        // A. Sorunun vektörünü al
         const questionEmbeddingResponse = await ollama.embeddings({
             model: 'nomic-embed-text',
             prompt: question
         });
         const questionEmbedding = questionEmbeddingResponse.embedding;
 
-        // B. Benzerlik skorlarını hesapla
-        const scoredChunks = globalChunks.map(chunk => {
-            const similarity = cosineSimilarity(questionEmbedding, chunk.embedding);
-            return { text: chunk.text, similarity };
-        });
+        const scoredChunks = globalChunks.map(chunk => ({
+            text: chunk.text,
+            similarity: cosineSimilarity(questionEmbedding, chunk.embedding)
+        }));
 
-        // C. En yakından en uzağa sırala
         scoredChunks.sort((a, b) => b.similarity - a.similarity);
-        const bestMatch = scoredChunks[0];
 
-        console.log(`En yakın chunk skor: ${bestMatch.similarity.toFixed(4)}`);
+        // TOP-K: sadece 1 değil, en yakın 4 chunk'ı al
+        const TOP_K = 4;
+        const topChunks = scoredChunks.slice(0, TOP_K);
 
-        // GÜVENLİK BARAJI (THRESHOLD): 
-        // Eğer en yakın dökümanın benzerliği %30'un (0.30) altındaysa, yapay zekaya alakasız bilgi vermeyelim.
-        let contextText = bestMatch.text;
-        if (bestMatch.similarity < 0.30) {
-            console.warn("Eşleşme skoru çok düşük, boş context gönderiliyor.");
+        console.log("Getirilen chunk skorları:", topChunks.map(c => c.similarity.toFixed(3)));
+
+        // Eşik kontrolünü artık EN İYİ skora göre yapıyoruz (top-1'e göre değil)
+        const bestScore = topChunks[0].similarity;
+        let contextText;
+
+        if (bestScore < 0.30) {
             contextText = "Bu soruyla ilgili yüklenen dökümanda hiçbir bilgi bulunmamaktadır.";
+        } else {
+            // Birden fazla chunk'ı numaralandırarak birleştir
+            contextText = topChunks
+                .map((c, i) => `[Kaynak ${i + 1}]: ${c.text}`)
+                .join('\n\n');
         }
 
-        // D. Llama modeline gönder
-        const systemPrompt = `Sen yardımcı bir yapay zeka asistanısın. Sadece sana verilen aşağıdaki bağlama (Context) sadık kalarak soruyu cevapla. Eğer bağlam içinde sorunun cevabı yoksa, kendi bilgini kullanma ve kibarca 'Bu bilgi dökümanda yer almıyor' de.
-Bağlam: "${contextText}"`;
+        const systemPrompt = `Sen yardımcı bir yapay zeka asistanısın. Sadece sana verilen aşağıdaki kaynaklara sadık kalarak soruyu cevapla. Kaynaklar arasında birbiriyle alakasız olanlar olabilir, sadece soruyla ilgili olanı kullan. Eğer hiçbir kaynak sorunun cevabını içermiyorsa, kendi bilgini kullanma ve kibarca 'Bu bilgi dökümanda yer almıyor' de.
+
+${contextText}`;
 
         const chatResponse = await ollama.chat({
             model: 'llama3.1:8b',
@@ -177,8 +183,7 @@ Bağlam: "${contextText}"`;
 
         res.json({
             question,
-            retrievedContext: contextText,
-            similarityScore: bestMatch.similarity,
+            retrievedChunks: topChunks,
             answer: chatResponse.message.content
         });
 
