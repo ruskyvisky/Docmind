@@ -2,15 +2,19 @@ const express = require('express');
 const multer = require('multer');
 const pdfParse = require('pdf-parse');
 const ollama = require('ollama').default;
+const crypto = require('crypto');
 const pool = require('./db');
+const redisClient = require('./redis');
+
 const app = express();
 app.use(express.json());
 
 // Bellek tabanlı dosya yükleme ayarı
 const upload = multer({ storage: multer.memoryStorage() });
 
-// Dinamik bellek havuzumuz
-let globalChunks = [];
+// ==========================================
+// YARDIMCI FONKSİYONLAR
+// ==========================================
 
 // Kosinüs Benzerliği Fonksiyonu
 function cosineSimilarity(vecA, vecB) {
@@ -46,6 +50,79 @@ function chunkText(text, chunkSize = 500, overlap = 50) {
     return chunks;
 }
 
+/**
+ * Verilen metin için SHA-256 hash üretir ve Redis namespace'i döner.
+ * Örnek: "embedding:4a8f9c2b..."
+ */
+function getEmbeddingCacheKey(text) {
+    const hash = crypto.createHash('sha256').update(text).digest('hex');
+    return `embedding:${hash}`;
+}
+
+/**
+ * Redis'ten tek bir embedding çeker. Redis down ise null döner (fallback).
+ */
+async function getCachedEmbedding(text) {
+    try {
+        const key = getEmbeddingCacheKey(text);
+        const value = await redisClient.get(key);
+        if (value) return JSON.parse(value);
+        return null;
+    } catch (err) {
+        console.warn('[Redis] getCachedEmbedding hatası (fallback aktif):', err.message);
+        return null;
+    }
+}
+
+/**
+ * Bir embedding'i Redis'e kaydeder. Redis down ise sessizce geçer.
+ */
+async function setCachedEmbedding(text, embedding) {
+    try {
+        const key = getEmbeddingCacheKey(text);
+        await redisClient.set(key, JSON.stringify(embedding));
+    } catch (err) {
+        console.warn('[Redis] setCachedEmbedding hatası (fallback aktif):', err.message);
+    }
+}
+
+/**
+ * Bir batch (dizi) metin için Redis'te MGET ile toplu sorgulama yapar.
+ * Dönen dizi: her index için { text, embedding } | null
+ * Redis down ise hepsi null döner (fallback).
+ */
+async function batchGetCachedEmbeddings(texts) {
+    try {
+        const keys = texts.map(getEmbeddingCacheKey);
+        const values = await redisClient.mGet(keys);
+        return values.map((v, i) => ({
+            text: texts[i],
+            embedding: v ? JSON.parse(v) : null,
+        }));
+    } catch (err) {
+        console.warn('[Redis] MGET hatası (fallback aktif):', err.message);
+        return texts.map(text => ({ text, embedding: null }));
+    }
+}
+
+/**
+ * Birden fazla embedding'i Redis'e toplu kaydeder (MSET).
+ * Redis down ise sessizce geçer.
+ */
+async function batchSetCachedEmbeddings(pairs) {
+    // pairs: [{ text, embedding }, ...]
+    if (pairs.length === 0) return;
+    try {
+        const msetArgs = {};
+        for (const { text, embedding } of pairs) {
+            msetArgs[getEmbeddingCacheKey(text)] = JSON.stringify(embedding);
+        }
+        await redisClient.mSet(msetArgs);
+    } catch (err) {
+        console.warn('[Redis] MSET hatası (fallback aktif):', err.message);
+    }
+}
+
 // ==========================================
 // ADIM 1: PDF YÜKLEME VE İŞLEME ENDPOINT'İ
 // ==========================================
@@ -76,35 +153,73 @@ app.post('/upload', upload.single('file'), async (req, res) => {
         const rawChunks = chunkText(fullText, 500, 50);
         const BATCH_SIZE = 5;
 
+        let totalCacheHits = 0;
+        let totalCacheMisses = 0;
+
         for (let i = 0; i < rawChunks.length; i += BATCH_SIZE) {
             const batch = rawChunks.slice(i, i + BATCH_SIZE);
 
-            const batchPromises = batch.map(async (chunkContent, idx) => {
-                const embeddingResponse = await ollama.embeddings({
-                    model: 'nomic-embed-text',
-                    prompt: chunkContent
-                });
-                return { content: chunkContent, embedding: embeddingResponse.embedding, index: i + idx };
+            // ── SORGULAMA FAZI: Tek MGET ile hepsini Redis'e sor ──
+            const cacheResults = await batchGetCachedEmbeddings(batch);
+
+            // ── KARAR FAZI: Hit / Miss ayır ──
+            const hits = [];   // { idx, text, embedding }
+            const misses = []; // { idx, text }
+
+            cacheResults.forEach(({ text, embedding }, localIdx) => {
+                const globalIdx = i + localIdx;
+                if (embedding !== null) {
+                    hits.push({ idx: globalIdx, text, embedding });
+                    totalCacheHits++;
+                } else {
+                    misses.push({ idx: globalIdx, text });
+                    totalCacheMisses++;
+                }
             });
 
-            const batchResults = await Promise.all(batchPromises);
+            // ── OLLAMA FAZI: Sadece miss olanları Ollama'ya gönder ──
+            let freshResults = []; // { idx, text, embedding }
+            if (misses.length > 0) {
+                const ollamaPromises = misses.map(async ({ idx, text }) => {
+                    const embeddingResponse = await ollama.embeddings({
+                        model: 'nomic-embed-text',
+                        prompt: text
+                    });
+                    return { idx, text, embedding: embeddingResponse.embedding };
+                });
+                freshResults = await Promise.all(ollamaPromises);
+            }
 
-            for (const item of batchResults) {
-                // pgvector, embedding'i '[0.1,0.2,...]' formatında string bekler
+            // ── KAYDETME FAZI: Yeni embedding'leri Redis'e toplu kaydet ──
+            if (freshResults.length > 0) {
+                await batchSetCachedEmbeddings(
+                    freshResults.map(({ text, embedding }) => ({ text, embedding }))
+                );
+            }
+
+            // ── BİRLEŞTİRME: Orijinal sırayı koru ──
+            const allResults = [...hits, ...freshResults];
+            allResults.sort((a, b) => a.idx - b.idx);
+
+            // PostgreSQL'e yaz
+            for (const item of allResults) {
                 const vectorString = `[${item.embedding.join(',')}]`;
                 await client.query(
                     'INSERT INTO chunks (document_id, content, embedding, chunk_index) VALUES ($1, $2, $3, $4)',
-                    [documentId, item.content, vectorString, item.index]
+                    [documentId, item.text, vectorString, item.idx]
                 );
             }
         }
 
         await client.query('COMMIT');
 
+        console.log(`[Upload] Cache istatistikleri → Hit: ${totalCacheHits}, Miss: ${totalCacheMisses}`);
+
         res.json({
             message: "PDF başarıyla yüklendi ve veritabanına kaydedildi!",
             documentId,
-            totalChunks: rawChunks.length
+            totalChunks: rawChunks.length,
+            cacheStats: { hits: totalCacheHits, misses: totalCacheMisses }
         });
 
     } catch (error) {
@@ -117,7 +232,7 @@ app.post('/upload', upload.single('file'), async (req, res) => {
 });
 
 // ==========================================
-// ADIM 2: SORU SORMA ENDPOINT'İ (GÜVENLİ HALE GETİRİLMİŞ)
+// ADIM 2: SORU SORMA ENDPOINT'İ
 // ==========================================
 app.post('/ask', async (req, res) => {
     const { question } = req.body;
@@ -127,11 +242,25 @@ app.post('/ask', async (req, res) => {
     }
 
     try {
-        const questionEmbeddingResponse = await ollama.embeddings({
-            model: 'nomic-embed-text',
-            prompt: question
-        });
-        const questionVector = `[${questionEmbeddingResponse.embedding.join(',')}]`;
+        // ── Sorunun embedding'ini önce Redis'ten sorgula (Bonus) ──
+        let questionEmbedding = await getCachedEmbedding(question);
+        let questionCacheHit = false;
+
+        if (questionEmbedding) {
+            questionCacheHit = true;
+            console.log('[Ask] Soru embedding\'i Redis cache\'ten alındı ✓');
+        } else {
+            const questionEmbeddingResponse = await ollama.embeddings({
+                model: 'nomic-embed-text',
+                prompt: question
+            });
+            questionEmbedding = questionEmbeddingResponse.embedding;
+            // Sonraki aynı soru için Redis'e kaydet
+            await setCachedEmbedding(question, questionEmbedding);
+            console.log('[Ask] Soru embedding\'i Ollama\'dan alındı ve önbelleğe kaydedildi.');
+        }
+
+        const questionVector = `[${questionEmbedding.join(',')}]`;
 
         const searchResult = await pool.query(
             `SELECT 
@@ -174,6 +303,7 @@ ${contextText}`;
 
         res.json({
             question,
+            questionCacheHit,
             retrievedChunks: topChunks,
             answer: chatResponse.message.content
         });

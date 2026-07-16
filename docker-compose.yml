@@ -15,5 +15,15 @@ services:
       - pgdata:/var/lib/postgresql/data
       - ./init.sql:/docker-entrypoint-initdb.d/init.sql
 
+  redis:
+    image: redis:alpine
+    container_name: docmind-redis
+    restart: always
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+
 volumes:
   pgdata:
+  redis_data:
