@@ -2,7 +2,7 @@ const express = require('express');
 const multer = require('multer');
 const pdfParse = require('pdf-parse');
 const ollama = require('ollama').default;
-
+const pool = require('./db');
 const app = express();
 app.use(express.json());
 
@@ -26,7 +26,7 @@ function cosineSimilarity(vecA, vecB) {
     return dotProduct / (Math.sqrt(normA) * Math.sqrt(normB));
 }
 
-// Güçlendirilmiş Chunking Fonksiyonu
+// Chunking Fonksiyonu
 function chunkText(text, chunkSize = 500, overlap = 50) {
     const cleanText = text.replace(/\r\n/g, '\n').trim();
 
@@ -47,79 +47,72 @@ function chunkText(text, chunkSize = 500, overlap = 50) {
 }
 
 // ==========================================
-// ADIM 1: PDF YÜKLEME VE İŞLEME ENDPOINT'İ (HIZLANDIRILMIŞ)
+// ADIM 1: PDF YÜKLEME VE İŞLEME ENDPOINT'İ
 // ==========================================
 app.post('/upload', upload.single('file'), async (req, res) => {
     if (!req.file) {
         return res.status(400).json({ error: "Lütfen bir dosya yükleyin." });
     }
 
-    try {
-        console.log(`Dosya alındı: ${req.file.originalname}`);
+    const client = await pool.connect();
 
-        // A. PDF'ten metni ayıkla
+    try {
         const pdfData = await pdfParse(req.file.buffer);
         const fullText = pdfData.text;
 
         if (!fullText || fullText.trim().length === 0) {
-            return res.status(400).json({ error: "Yüklenen PDF'ten metin okunamadı veya PDF boş." });
+            return res.status(400).json({ error: "Yüklenen PDF'ten metin okunamadı." });
         }
 
-        // B. Metni parçala
+        // Transaction başlat - ya hepsi başarılı olur ya da hiçbiri kaydedilmez
+        await client.query('BEGIN');
+
+        const docResult = await client.query(
+            'INSERT INTO documents (filename) VALUES ($1) RETURNING id',
+            [req.file.originalname]
+        );
+        const documentId = docResult.rows[0].id;
+
         const rawChunks = chunkText(fullText, 500, 50);
-        console.log(`Metin ${rawChunks.length} adet parçaya (chunk) bölündü.`);
-
-        // C. BATCH (TOPLU) EMBEDDING:
-        // Tüm chunk'ları aynı anda göndermek Ollama'yı bunaltır ("maximum pending requests exceeded").
-        // Bunun yerine chunk'ları küçük gruplar (batch) halinde işliyoruz.
-        // Her batch tamamlanmadan bir sonrakine geçmiyoruz.
-        const BATCH_SIZE = 5; // Aynı anda en fazla 5 istek gönder
-        const allResults = [];
-
-        console.log(`Embedding işlemleri ${BATCH_SIZE}'li gruplar halinde başlatılıyor...`);
+        const BATCH_SIZE = 5;
 
         for (let i = 0; i < rawChunks.length; i += BATCH_SIZE) {
-            // Mevcut batch'i al (son batch, BATCH_SIZE'dan küçük olabilir)
             const batch = rawChunks.slice(i, i + BATCH_SIZE);
-            const batchIndex = Math.floor(i / BATCH_SIZE) + 1;
-            const totalBatches = Math.ceil(rawChunks.length / BATCH_SIZE);
-            console.log(`Batch ${batchIndex}/${totalBatches} işleniyor (${batch.length} chunk)...`);
 
-            // Bu batch'teki chunk'ları paralel gönder, batch bitmeden devam etme
-            const batchPromises = batch.map(async (chunkTextContent) => {
-                try {
-                    const embeddingResponse = await ollama.embeddings({
-                        model: 'nomic-embed-text',
-                        prompt: chunkTextContent
-                    });
-                    return {
-                        text: chunkTextContent,
-                        embedding: embeddingResponse.embedding
-                    };
-                } catch (err) {
-                    console.error("Bir chunk embed edilirken hata oluştu, atlanıyor...", err.message);
-                    return null;
-                }
+            const batchPromises = batch.map(async (chunkContent, idx) => {
+                const embeddingResponse = await ollama.embeddings({
+                    model: 'nomic-embed-text',
+                    prompt: chunkContent
+                });
+                return { content: chunkContent, embedding: embeddingResponse.embedding, index: i + idx };
             });
 
-            // Bu batch'in tamamlanmasını bekle, sonra döngü bir sonraki batch'e geçer
             const batchResults = await Promise.all(batchPromises);
-            allResults.push(...batchResults);
+
+            for (const item of batchResults) {
+                // pgvector, embedding'i '[0.1,0.2,...]' formatında string bekler
+                const vectorString = `[${item.embedding.join(',')}]`;
+                await client.query(
+                    'INSERT INTO chunks (document_id, content, embedding, chunk_index) VALUES ($1, $2, $3, $4)',
+                    [documentId, item.content, vectorString, item.index]
+                );
+            }
         }
 
-        // Hatalı veya boş dönen chunk'ları filtrele
-        globalChunks = allResults.filter(item => item !== null);
-
-        console.log(`Hafıza güncellendi. Toplam aktif chunk: ${globalChunks.length}`);
+        await client.query('COMMIT');
 
         res.json({
-            message: "PDF başarıyla yüklendi, parçalandı ve paralel olarak embed edildi!",
-            totalChunks: globalChunks.length
+            message: "PDF başarıyla yüklendi ve veritabanına kaydedildi!",
+            documentId,
+            totalChunks: rawChunks.length
         });
 
     } catch (error) {
+        await client.query('ROLLBACK');
         console.error("PDF işleme hatası:", error);
-        res.status(500).json({ error: "PDF işlenirken bir hata oluştu.", details: error.message });
+        res.status(500).json({ error: "PDF işlenirken hata oluştu.", details: error.message });
+    } finally {
+        client.release();
     }
 });
 
@@ -129,9 +122,6 @@ app.post('/upload', upload.single('file'), async (req, res) => {
 app.post('/ask', async (req, res) => {
     const { question } = req.body;
 
-    if (globalChunks.length === 0) {
-        return res.status(400).json({ error: "Lütfen önce /upload endpoint'ini kullanarak bir PDF yükleyin." });
-    }
     if (!question) {
         return res.status(400).json({ error: "Lütfen 'question' parametresini gönderin." });
     }
@@ -141,35 +131,36 @@ app.post('/ask', async (req, res) => {
             model: 'nomic-embed-text',
             prompt: question
         });
-        const questionEmbedding = questionEmbeddingResponse.embedding;
+        const questionVector = `[${questionEmbeddingResponse.embedding.join(',')}]`;
 
-        const scoredChunks = globalChunks.map(chunk => ({
-            text: chunk.text,
-            similarity: cosineSimilarity(questionEmbedding, chunk.embedding)
-        }));
+        const searchResult = await pool.query(
+            `SELECT 
+                content, 
+                1 - (embedding <=> $1) AS similarity
+             FROM chunks
+             ORDER BY embedding <=> $1
+             LIMIT 5`,
+            [questionVector]
+        );
 
-        scoredChunks.sort((a, b) => b.similarity - a.similarity);
+        const topChunks = searchResult.rows;
 
-        // TOP-K: sadece 1 değil, en yakın 4 chunk'ı al
-        const TOP_K = 4;
-        const topChunks = scoredChunks.slice(0, TOP_K);
+        if (topChunks.length === 0) {
+            return res.status(400).json({ error: "Veritabanında hiç chunk yok, önce bir doküman yükleyin." });
+        }
 
-        console.log("Getirilen chunk skorları:", topChunks.map(c => c.similarity.toFixed(3)));
-
-        // Eşik kontrolünü artık EN İYİ skora göre yapıyoruz (top-1'e göre değil)
         const bestScore = topChunks[0].similarity;
         let contextText;
 
         if (bestScore < 0.30) {
             contextText = "Bu soruyla ilgili yüklenen dökümanda hiçbir bilgi bulunmamaktadır.";
         } else {
-            // Birden fazla chunk'ı numaralandırarak birleştir
             contextText = topChunks
-                .map((c, i) => `[Kaynak ${i + 1}]: ${c.text}`)
+                .map((c, i) => `[Kaynak ${i + 1}]: ${c.content}`)
                 .join('\n\n');
         }
 
-        const systemPrompt = `Sen yardımcı bir yapay zeka asistanısın. Sadece sana verilen aşağıdaki kaynaklara sadık kalarak soruyu cevapla. Kaynaklar arasında birbiriyle alakasız olanlar olabilir, sadece soruyla ilgili olanı kullan. Eğer hiçbir kaynak sorunun cevabını içermiyorsa, kendi bilgini kullanma ve kibarca 'Bu bilgi dökümanda yer almıyor' de.
+        const systemPrompt = `Sen yardımcı bir yapay zeka asistanısın. Sadece sana verilen aşağıdaki kaynaklara sadık kalarak soruyu cevapla. Kaynaklar arasında birbiriyle alakasız olanlar olabilir, sadece soruyla ilgili olanı kullan. Eğer hiçbir kaynak sorunun cevabını içermiyorsa, kibarca 'Bu bilgi dökümanda yer almıyor' de.
 
 ${contextText}`;
 
@@ -189,7 +180,7 @@ ${contextText}`;
 
     } catch (error) {
         console.error("Soru cevaplama hatası:", error);
-        res.status(500).json({ error: "Soru cevaplanırken bir hata oluştu.", details: error.message });
+        res.status(500).json({ error: "Soru cevaplanırken hata oluştu.", details: error.message });
     }
 });
 
