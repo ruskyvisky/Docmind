@@ -1,5 +1,8 @@
 node_modules
-uploads
-.env
-uploads\1784294208935-4364ebbd-3f4d-44b3-a96f-f1ebfc08971e.pdf
+npm-debug.log
+.git
 .gitignore
+.env
+uploads/*
+!uploads/.gitkeep
+*.md

@@ -1,25 +1,26 @@
+// redis.js - Redis Connection
 const { createClient } = require('redis');
+
+const REDIS_HOST = process.env.REDIS_HOST || 'localhost';
+const REDIS_PORT = process.env.REDIS_PORT || 6379;
 
 const client = createClient({
     socket: {
-        host: 'localhost',
-        port: 6379,
+        host: REDIS_HOST,
+        port: REDIS_PORT,
     }
 });
 
 client.on('error', (err) => {
-    // Bağlantı kopsa da uygulama çökmez; sadece loglayıp devam eder
-    console.error('[Redis] Bağlantı hatası:', err.message);
+    console.error('[Redis] Connection error:', err.message);
 });
 
-// Uygulama başlarken bağlan
 client.connect()
     .then(() => {
-        console.log('[Redis] Bağlantı başarılı! ✓');
+        console.log(`[Redis] Connected to ${REDIS_HOST}:${REDIS_PORT} ✓`);
     })
     .catch((err) => {
-        console.error('[Redis] İlk bağlantı denemesi başarısız:', err.message);
-        // Hata fırlatmıyoruz → uygulama ayakta kalmaya devam eder
+        console.error('[Redis] Initial connection failed:', err.message);
     });
 
 module.exports = client;
