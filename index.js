@@ -1,238 +1,144 @@
 const express = require('express');
 const multer = require('multer');
-const pdfParse = require('pdf-parse');
+const path = require('path');
+const fs = require('fs');
+const { v4: uuidv4 } = require('uuid');
+const { Queue } = require('bullmq');
 const ollama = require('ollama').default;
-const crypto = require('crypto');
 const pool = require('./db');
 const redisClient = require('./redis');
+const connection = require('./bullmq-connection');
+const { getCachedEmbedding, setCachedEmbedding } = require('./utils');
+
+// Worker'ı aynı süreçte başlat
+require('./worker');
 
 const app = express();
 app.use(express.json());
 
-// Bellek tabanlı dosya yükleme ayarı
-const upload = multer({ storage: multer.memoryStorage() });
-
 // ==========================================
-// YARDIMCI FONKSİYONLAR
+// MULTER — DISK STORAGE
 // ==========================================
+const UPLOADS_DIR = path.join(__dirname, 'uploads');
 
-// Kosinüs Benzerliği Fonksiyonu
-function cosineSimilarity(vecA, vecB) {
-    let dotProduct = 0.0;
-    let normA = 0.0;
-    let normB = 0.0;
-    for (let i = 0; i < vecA.length; i++) {
-        dotProduct += vecA[i] * vecB[i];
-        normA += vecA[i] * vecA[i];
-        normB += vecB[i] * vecB[i];
-    }
-    if (normA === 0 || normB === 0) return 0;
-    return dotProduct / (Math.sqrt(normA) * Math.sqrt(normB));
+// uploads/ klasörü yoksa oluştur
+if (!fs.existsSync(UPLOADS_DIR)) {
+    fs.mkdirSync(UPLOADS_DIR, { recursive: true });
+    console.log('[Multer] uploads/ klasörü oluşturuldu.');
 }
 
-// Chunking Fonksiyonu
-function chunkText(text, chunkSize = 500, overlap = 50) {
-    const cleanText = text.replace(/\r\n/g, '\n').trim();
+const storage = multer.diskStorage({
+    destination: (req, file, cb) => {
+        cb(null, UPLOADS_DIR);
+    },
+    filename: (req, file, cb) => {
+        const ext = path.extname(file.originalname);
+        const uniqueName = `${Date.now()}-${uuidv4()}${ext}`;
+        cb(null, uniqueName);
+    },
+});
 
-    // Önce "Bölüm X:" gibi başlıklara göre böl
-    const sections = cleanText.split(/(?=Bölüm \d+:)/g).filter(s => s.trim().length > 0);
-
-    const chunks = [];
-    for (const section of sections) {
-        const clean = section.replace(/\s+/g, ' ').trim();
-        let i = 0;
-        while (i < clean.length) {
-            const chunk = clean.substring(i, i + chunkSize);
-            chunks.push(chunk);
-            i += (chunkSize - overlap);
+const upload = multer({
+    storage,
+    fileFilter: (req, file, cb) => {
+        if (file.mimetype === 'application/pdf') {
+            cb(null, true);
+        } else {
+            cb(new Error('Yalnızca PDF dosyaları kabul edilmektedir.'));
         }
-    }
-    return chunks;
-}
-
-/**
- * Verilen metin için SHA-256 hash üretir ve Redis namespace'i döner.
- * Örnek: "embedding:4a8f9c2b..."
- */
-function getEmbeddingCacheKey(text) {
-    const hash = crypto.createHash('sha256').update(text).digest('hex');
-    return `embedding:${hash}`;
-}
-
-/**
- * Redis'ten tek bir embedding çeker. Redis down ise null döner (fallback).
- */
-async function getCachedEmbedding(text) {
-    try {
-        const key = getEmbeddingCacheKey(text);
-        const value = await redisClient.get(key);
-        if (value) return JSON.parse(value);
-        return null;
-    } catch (err) {
-        console.warn('[Redis] getCachedEmbedding hatası (fallback aktif):', err.message);
-        return null;
-    }
-}
-
-/**
- * Bir embedding'i Redis'e kaydeder. Redis down ise sessizce geçer.
- */
-async function setCachedEmbedding(text, embedding) {
-    try {
-        const key = getEmbeddingCacheKey(text);
-        await redisClient.set(key, JSON.stringify(embedding));
-    } catch (err) {
-        console.warn('[Redis] setCachedEmbedding hatası (fallback aktif):', err.message);
-    }
-}
-
-/**
- * Bir batch (dizi) metin için Redis'te MGET ile toplu sorgulama yapar.
- * Dönen dizi: her index için { text, embedding } | null
- * Redis down ise hepsi null döner (fallback).
- */
-async function batchGetCachedEmbeddings(texts) {
-    try {
-        const keys = texts.map(getEmbeddingCacheKey);
-        const values = await redisClient.mGet(keys);
-        return values.map((v, i) => ({
-            text: texts[i],
-            embedding: v ? JSON.parse(v) : null,
-        }));
-    } catch (err) {
-        console.warn('[Redis] MGET hatası (fallback aktif):', err.message);
-        return texts.map(text => ({ text, embedding: null }));
-    }
-}
-
-/**
- * Birden fazla embedding'i Redis'e toplu kaydeder (MSET).
- * Redis down ise sessizce geçer.
- */
-async function batchSetCachedEmbeddings(pairs) {
-    // pairs: [{ text, embedding }, ...]
-    if (pairs.length === 0) return;
-    try {
-        const msetArgs = {};
-        for (const { text, embedding } of pairs) {
-            msetArgs[getEmbeddingCacheKey(text)] = JSON.stringify(embedding);
-        }
-        await redisClient.mSet(msetArgs);
-    } catch (err) {
-        console.warn('[Redis] MSET hatası (fallback aktif):', err.message);
-    }
-}
+    },
+});
 
 // ==========================================
-// ADIM 1: PDF YÜKLEME VE İŞLEME ENDPOINT'İ
+// BULLMQ KUYRUK (PRODUCER)
+// ==========================================
+const ingestionQueue = new Queue('ingestion-queue', { connection });
+
+// ==========================================
+// ADIM 1: PDF YÜKLEME ENDPOINT'İ (PRODUCER)
 // ==========================================
 app.post('/upload', upload.single('file'), async (req, res) => {
     if (!req.file) {
-        return res.status(400).json({ error: "Lütfen bir dosya yükleyin." });
+        return res.status(400).json({ error: 'Lütfen bir PDF dosyası yükleyin.' });
     }
 
-    const client = await pool.connect();
-
     try {
-        const pdfData = await pdfParse(req.file.buffer);
-        const fullText = pdfData.text;
+        const filePath = req.file.path;
+        const originalName = req.file.originalname;
 
-        if (!fullText || fullText.trim().length === 0) {
-            return res.status(400).json({ error: "Yüklenen PDF'ten metin okunamadı." });
-        }
-
-        // Transaction başlat - ya hepsi başarılı olur ya da hiçbiri kaydedilmez
-        await client.query('BEGIN');
-
-        const docResult = await client.query(
-            'INSERT INTO documents (filename) VALUES ($1) RETURNING id',
-            [req.file.originalname]
+        // PostgreSQL'e "processing" durumuyla kayıt ekle
+        const docResult = await pool.query(
+            'INSERT INTO documents (filename, status) VALUES ($1, $2) RETURNING id',
+            [originalName, 'processing']
         );
         const documentId = docResult.rows[0].id;
 
-        const rawChunks = chunkText(fullText, 500, 50);
-        const BATCH_SIZE = 5;
-
-        let totalCacheHits = 0;
-        let totalCacheMisses = 0;
-
-        for (let i = 0; i < rawChunks.length; i += BATCH_SIZE) {
-            const batch = rawChunks.slice(i, i + BATCH_SIZE);
-
-            // ── SORGULAMA FAZI: Tek MGET ile hepsini Redis'e sor ──
-            const cacheResults = await batchGetCachedEmbeddings(batch);
-
-            // ── KARAR FAZI: Hit / Miss ayır ──
-            const hits = [];   // { idx, text, embedding }
-            const misses = []; // { idx, text }
-
-            cacheResults.forEach(({ text, embedding }, localIdx) => {
-                const globalIdx = i + localIdx;
-                if (embedding !== null) {
-                    hits.push({ idx: globalIdx, text, embedding });
-                    totalCacheHits++;
-                } else {
-                    misses.push({ idx: globalIdx, text });
-                    totalCacheMisses++;
-                }
-            });
-
-            // ── OLLAMA FAZI: Sadece miss olanları Ollama'ya gönder ──
-            let freshResults = []; // { idx, text, embedding }
-            if (misses.length > 0) {
-                const ollamaPromises = misses.map(async ({ idx, text }) => {
-                    const embeddingResponse = await ollama.embeddings({
-                        model: 'nomic-embed-text',
-                        prompt: text
-                    });
-                    return { idx, text, embedding: embeddingResponse.embedding };
-                });
-                freshResults = await Promise.all(ollamaPromises);
+        // Kuyruğa iş ekle
+        await ingestionQueue.add(
+            'process-pdf',
+            { documentId, filePath, originalName },
+            {
+                attempts: 3,                   // Hata olursa 3 kez dene
+                backoff: {
+                    type: 'exponential',
+                    delay: 5000,               // 5s, 10s, 20s
+                },
+                removeOnComplete: 100,         // Son 100 tamamlanan işi tut
+                removeOnFail: 50,              // Son 50 başarısız işi tut
             }
+        );
 
-            // ── KAYDETME FAZI: Yeni embedding'leri Redis'e toplu kaydet ──
-            if (freshResults.length > 0) {
-                await batchSetCachedEmbeddings(
-                    freshResults.map(({ text, embedding }) => ({ text, embedding }))
-                );
-            }
+        console.log(`[Upload] "${originalName}" kuyruğa eklendi → documentId=${documentId}`);
 
-            // ── BİRLEŞTİRME: Orijinal sırayı koru ──
-            const allResults = [...hits, ...freshResults];
-            allResults.sort((a, b) => a.idx - b.idx);
-
-            // PostgreSQL'e yaz
-            for (const item of allResults) {
-                const vectorString = `[${item.embedding.join(',')}]`;
-                await client.query(
-                    'INSERT INTO chunks (document_id, content, embedding, chunk_index) VALUES ($1, $2, $3, $4)',
-                    [documentId, item.text, vectorString, item.idx]
-                );
-            }
-        }
-
-        await client.query('COMMIT');
-
-        console.log(`[Upload] Cache istatistikleri → Hit: ${totalCacheHits}, Miss: ${totalCacheMisses}`);
-
-        res.json({
-            message: "PDF başarıyla yüklendi ve veritabanına kaydedildi!",
+        return res.status(202).json({
+            message: 'Dosya yükleme işlemi arka planda başlatıldı.',
             documentId,
-            totalChunks: rawChunks.length,
-            cacheStats: { hits: totalCacheHits, misses: totalCacheMisses }
+            status: 'processing',
         });
 
     } catch (error) {
-        await client.query('ROLLBACK');
-        console.error("PDF işleme hatası:", error);
-        res.status(500).json({ error: "PDF işlenirken hata oluştu.", details: error.message });
-    } finally {
-        client.release();
+        console.error('[Upload] Hata:', error);
+        return res.status(500).json({ error: 'Dosya yükleme sırasında hata oluştu.', details: error.message });
     }
 });
 
 // ==========================================
-// ADIM 2: SORU SORMA ENDPOINT'İ
+// ADIM 2: DURUM SORGULAMA ENDPOINT'İ
+// ==========================================
+app.get('/documents/:id/status', async (req, res) => {
+    const { id } = req.params;
+
+    if (isNaN(parseInt(id, 10))) {
+        return res.status(400).json({ error: 'Geçersiz doküman ID.' });
+    }
+
+    try {
+        const result = await pool.query(
+            'SELECT id, filename, status, uploaded_at FROM documents WHERE id = $1',
+            [id]
+        );
+
+        if (result.rows.length === 0) {
+            return res.status(404).json({ error: `ID=${id} olan doküman bulunamadı.` });
+        }
+
+        const doc = result.rows[0];
+
+        return res.json({
+            documentId: doc.id,
+            filename: doc.filename,
+            status: doc.status,
+            uploadedAt: doc.uploaded_at,
+        });
+
+    } catch (error) {
+        console.error('[Status] Hata:', error);
+        return res.status(500).json({ error: 'Durum sorgulanırken hata oluştu.', details: error.message });
+    }
+});
+
+// ==========================================
+// ADIM 3: SORU SORMA ENDPOINT'İ
 // ==========================================
 app.post('/ask', async (req, res) => {
     const { question } = req.body;
@@ -242,22 +148,22 @@ app.post('/ask', async (req, res) => {
     }
 
     try {
-        // ── Sorunun embedding'ini önce Redis'ten sorgula (Bonus) ──
+        // Sorunun embedding'ini önce Redis'ten sorgula
         let questionEmbedding = await getCachedEmbedding(question);
         let questionCacheHit = false;
 
         if (questionEmbedding) {
             questionCacheHit = true;
-            console.log('[Ask] Soru embedding\'i Redis cache\'ten alındı ✓');
+            console.log("[Ask] Soru embedding'i Redis cache'ten alındı ✓");
         } else {
             const questionEmbeddingResponse = await ollama.embeddings({
                 model: 'nomic-embed-text',
-                prompt: question
+                prompt: question,
             });
             questionEmbedding = questionEmbeddingResponse.embedding;
             // Sonraki aynı soru için Redis'e kaydet
             await setCachedEmbedding(question, questionEmbedding);
-            console.log('[Ask] Soru embedding\'i Ollama\'dan alındı ve önbelleğe kaydedildi.');
+            console.log("[Ask] Soru embedding'i Ollama'dan alındı ve önbelleğe kaydedildi.");
         }
 
         const questionVector = `[${questionEmbedding.join(',')}]`;
@@ -275,46 +181,48 @@ app.post('/ask', async (req, res) => {
         const topChunks = searchResult.rows;
 
         if (topChunks.length === 0) {
-            return res.status(400).json({ error: "Veritabanında hiç chunk yok, önce bir doküman yükleyin." });
+            return res.status(400).json({ error: 'Veritabanında hiç chunk yok, önce bir doküman yükleyin.' });
         }
 
         const bestScore = topChunks[0].similarity;
         let contextText;
 
         if (bestScore < 0.30) {
-            contextText = "Bu soruyla ilgili yüklenen dökümanda hiçbir bilgi bulunmamaktadır.";
+            contextText = 'Bu soruyla ilgili yüklenen dökümanda hiçbir bilgi bulunmamaktadır.';
         } else {
             contextText = topChunks
                 .map((c, i) => `[Kaynak ${i + 1}]: ${c.content}`)
                 .join('\n\n');
         }
 
-        const systemPrompt = `Sen yardımcı bir yapay zeka asistanısın. Sadece sana verilen aşağıdaki kaynaklara sadık kalarak soruyu cevapla. Kaynaklar arasında birbiriyle alakasız olanlar olabilir, sadece soruyla ilgili olanı kullan. Eğer hiçbir kaynak sorunun cevabını içermiyorsa, kibarca 'Bu bilgi dökümanda yer almıyor' de.
-
-${contextText}`;
+        const systemPrompt = `Sen yardımcı bir yapay zeka asistanısın. Sadece sana verilen aşağıdaki kaynaklara sadık kalarak soruyu cevapla. Kaynaklar arasında birbiriyle alakasız olanlar olabilir, sadece soruyla ilgili olanı kullan. Eğer hiçbir kaynak sorunun cevabını içermiyorsa, kibarca 'Bu bilgi dökümanda yer almıyor' de.\n\n${contextText}`;
 
         const chatResponse = await ollama.chat({
             model: 'llama3.1:8b',
             messages: [
                 { role: 'system', content: systemPrompt },
-                { role: 'user', content: question }
-            ]
+                { role: 'user', content: question },
+            ],
         });
 
         res.json({
             question,
             questionCacheHit,
             retrievedChunks: topChunks,
-            answer: chatResponse.message.content
+            answer: chatResponse.message.content,
         });
 
     } catch (error) {
-        console.error("Soru cevaplama hatası:", error);
-        res.status(500).json({ error: "Soru cevaplanırken hata oluştu.", details: error.message });
+        console.error('Soru cevaplama hatası:', error);
+        res.status(500).json({ error: 'Soru cevaplanırken hata oluştu.', details: error.message });
     }
 });
 
 const PORT = 3000;
 app.listen(PORT, () => {
-    console.log(`RAG Sunucusu http://localhost:${PORT} adresinde aktif!`);
+    console.log(`\nRAG Sunucusu http://localhost:${PORT} adresinde aktif!`);
+    console.log('Endpointler:');
+    console.log(`  POST http://localhost:${PORT}/upload`);
+    console.log(`  GET  http://localhost:${PORT}/documents/:id/status`);
+    console.log(`  POST http://localhost:${PORT}/ask\n`);
 });

@@ -3,6 +3,7 @@ CREATE EXTENSION IF NOT EXISTS vector;
 CREATE TABLE documents (
     id SERIAL PRIMARY KEY,
     filename TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'processing',
     uploaded_at TIMESTAMPTZ DEFAULT now()
 );
 

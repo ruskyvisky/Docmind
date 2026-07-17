@@ -11,11 +11,13 @@
   "license": "ISC",
   "type": "commonjs",
   "dependencies": {
+    "bullmq": "^5.80.6",
     "express": "^5.2.1",
     "multer": "^2.2.0",
     "ollama": "^0.6.3",
     "pdf-parse": "^1.1.1",
     "pg": "^8.22.0",
-    "redis": "^6.1.0"
+    "redis": "^6.1.0",
+    "uuid": "^14.0.1"
   }
 }
