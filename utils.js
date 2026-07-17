@@ -102,12 +102,13 @@ async function ollamaChat(messages) {
         body: JSON.stringify({
             model: 'llama3.1:8b',
             messages,
-            stream: false
+            stream: true  // ← Stream aktif!
         })
     });
+
     if (!response.ok) throw new Error(`Ollama chat error: ${response.status}`);
-    const data = await response.json();
-    return { message: { content: data.message.content } };
+
+    return response.body; // ReadableStream
 }
 
 module.exports = {

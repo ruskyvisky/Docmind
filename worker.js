@@ -14,7 +14,7 @@ const QUEUE_NAME = 'ingestion-queue';
 const BATCH_SIZE = 5;
 
 // ==========================================
-// BULLMQ WORKER — PDF İŞLEME TÜKETİCİSİ
+// BULLMQ WORKER — PDF İŞLEME TÜK1ETİCİSİ
 // ==========================================
 const worker = new Worker(
     QUEUE_NAME,

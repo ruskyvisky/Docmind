@@ -34,21 +34,9 @@ services:
       timeout: 5s
       retries: 5
 
-  ollama:
-    image: ollama/ollama:latest
-    container_name: docmind-ollama
-    restart: always
-    ports:
-      - "11434:11434"
-    volumes:
-      - ollama_data:/root/.ollama
-    # GPU ayarı kaldırıldı - CPU üzerinde çalışır
-    healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:11434/api/tags"]
-      interval: 10s
-      timeout: 5s
-      retries: 10
-
+  # Ollama: Docker container yerine Windows'ta kurulu Ollama kullanılıyor.
+  # app servisi, host.docker.internal üzerinden Windows Ollama'ya bağlanır.
+  # Bu sayede modellerin (llama3.1:8b, nomic-embed-text) yeniden indirilmesi gerekmez.
   app:
     build:
       context: .
@@ -64,7 +52,8 @@ services:
       - DB_NAME=docmind_db
       - REDIS_HOST=redis
       - REDIS_PORT=6379
-      - OLLAMA_HOST=http://ollama:11434
+      # host.docker.internal → Docker container içinden Windows host'a erişim
+      - OLLAMA_HOST=http://host.docker.internal:11434
     ports:
       - "3000:3000"
     volumes:
@@ -74,10 +63,10 @@ services:
         condition: service_healthy
       redis:
         condition: service_healthy
-      ollama:
-        condition: service_started
+    extra_hosts:
+      # Linux Docker için gerekli (Windows/Mac'te otomatik gelir)
+      - "host.docker.internal:host-gateway"
 
 volumes:
   pgdata:
   redis_data:
-  ollama_data:

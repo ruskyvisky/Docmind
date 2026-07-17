@@ -1,0 +1,210 @@
+<!DOCTYPE html>
+<html lang="tr">
+
+<head>
+    <meta charset="UTF-8">
+    <title>DocMind</title>
+    <style>
+        body {
+            font-family: system-ui;
+            max-width: 800px;
+            margin: 2rem auto;
+            padding: 1rem;
+            background: #0f0f23;
+            color: #e0e0e0;
+        }
+
+        input {
+            width: 70%;
+            padding: 0.75rem;
+            font-size: 1rem;
+            border-radius: 8px;
+            border: 1px solid #333;
+            background: #1a1a2e;
+            color: #fff;
+        }
+
+        button {
+            padding: 0.75rem 1.5rem;
+            font-size: 1rem;
+            background: #00d4aa;
+            color: #0f0f23;
+            border: none;
+            border-radius: 8px;
+            cursor: pointer;
+            margin-left: 0.5rem;
+        }
+
+        button:disabled {
+            opacity: 0.5;
+        }
+
+        #metadata {
+            margin: 1rem 0;
+            padding: 0.75rem;
+            background: #1a1a2e;
+            border-radius: 8px;
+            font-size: 0.85rem;
+            color: #888;
+            border-left: 3px solid #00d4aa;
+        }
+
+        #response {
+            min-height: 150px;
+            padding: 1rem;
+            background: #1a1a2e;
+            border-radius: 8px;
+            line-height: 1.7;
+            white-space: pre-wrap;
+            border: 1px solid #2a2a4e;
+        }
+
+        .token {
+            display: inline;
+        }
+
+        .error {
+            color: #ff6b6b;
+        }
+
+        .loading {
+            display: inline-block;
+            width: 16px;
+            height: 16px;
+            border: 2px solid #333;
+            border-top-color: #00d4aa;
+            border-radius: 50%;
+            animation: spin 1s linear infinite;
+            margin-left: 0.5rem;
+        }
+
+        @keyframes spin {
+            to {
+                transform: rotate(360deg);
+            }
+        }
+    </style>
+</head>
+
+<body>
+    <h1>🧠 DocMind</h1>
+    <div>
+        <input type="text" id="question" placeholder="Sorunuzu yazın..." value="Merhaba, nasılsın?">
+        <button id="btn" onclick="ask()">Sor</button>
+    </div>
+    <div id="metadata" style="display:none;"></div>
+    <div id="response"></div>
+
+    <script>
+        async function ask() {
+            const input = document.getElementById('question');
+            const btn = document.getElementById('btn');
+            const responseDiv = document.getElementById('response');
+            const metadataDiv = document.getElementById('metadata');
+
+            const question = input.value.trim();
+            if (!question) return;
+
+            input.disabled = true;
+            btn.disabled = true;
+            btn.innerHTML = 'Düşünüyor<span class="loading"></span>';
+            responseDiv.innerHTML = '';
+            metadataDiv.style.display = 'none';
+
+            try {
+                const response = await fetch('http://localhost:3000/ask', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ question })
+                });
+
+                if (!response.ok) {
+                    const err = await response.json();
+                    throw new Error(err.details || err.error);
+                }
+
+                const reader = response.body.getReader();
+                const decoder = new TextDecoder();
+                let buffer = '';
+
+                while (true) {
+                    const { done, value } = await reader.read();
+                    if (done) break;
+
+                    buffer += decoder.decode(value, { stream: true });
+                    const events = parseSSE(buffer);
+                    buffer = ''; // Parse edilenleri temizle (basit yaklaşım)
+
+                    for (const event of events) {
+                        handleEvent(event, responseDiv, metadataDiv);
+                    }
+                }
+
+            } catch (error) {
+                responseDiv.innerHTML = `<span class="error">❌ Hata: ${error.message}</span>`;
+            } finally {
+                input.disabled = false;
+                btn.disabled = false;
+                btn.textContent = 'Sor';
+            }
+        }
+
+        function parseSSE(raw) {
+            const events = [];
+            const blocks = raw.split('\n\n');
+
+            for (const block of blocks) {
+                const lines = block.trim().split('\n');
+                if (lines.length < 2) continue;
+
+                const eventLine = lines.find(l => l.startsWith('event:'));
+                const dataLine = lines.find(l => l.startsWith('data:'));
+
+                if (eventLine && dataLine) {
+                    events.push({
+                        event: eventLine.slice(6).trim(),
+                        data: dataLine.slice(5).trim()
+                    });
+                }
+            }
+            return events;
+        }
+
+        function handleEvent(event, responseDiv, metadataDiv) {
+            try {
+                const data = JSON.parse(event.data);
+
+                switch (event.event) {
+                    case 'metadata':
+                        metadataDiv.innerHTML = `
+                            <strong>🔍</strong> ${data.searchMode} | 
+                            <strong>Skor:</strong> ${data.bestScore} | 
+                            <strong>Cache:</strong> ${data.questionCacheHit ? '✓' : '✗'} | 
+                            <strong>Chunks:</strong> ${data.retrievedChunks.length}
+                        `;
+                        metadataDiv.style.display = 'block';
+                        break;
+
+                    case 'token':
+                        const span = document.createElement('span');
+                        span.className = 'token';
+                        span.textContent = data.token;
+                        responseDiv.appendChild(span);
+                        break;
+
+                    case 'done':
+                        console.log('Tamamlandı:', data.fullAnswer);
+                        break;
+
+                    case 'error':
+                        responseDiv.innerHTML += `\n\n<span class="error">❌ ${data.details || data.error}</span>`;
+                        break;
+                }
+            } catch (e) {
+                console.warn('Event parse hatası:', e);
+            }
+        }
+    </script>
+</body>
+
+</html>

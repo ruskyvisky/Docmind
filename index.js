@@ -5,7 +5,7 @@ const fs = require('fs');
 const { v4: uuidv4 } = require('uuid');
 const { Queue } = require('bullmq');
 const pool = require('./db');
-const redisClient = require('./redis');
+const cors = require('cors');
 const connection = require('./bullmq-connection');
 const {
     getCachedEmbedding,
@@ -15,15 +15,19 @@ const {
     OLLAMA_HOST
 } = require('./utils');
 
-// Worker'ı aynı süreçte başlat
 require('./worker');
 
 const app = express();
+
+app.use(cors({
+    origin: '*',
+    methods: ['GET', 'POST', 'OPTIONS'],
+    allowedHeaders: ['Content-Type', 'Authorization'],
+    credentials: false
+}));
+
 app.use(express.json());
 
-// ==========================================
-// MULTER — DISK STORAGE
-// ==========================================
 const UPLOADS_DIR = path.join(__dirname, 'uploads');
 
 if (!fs.existsSync(UPLOADS_DIR)) {
@@ -51,14 +55,8 @@ const upload = multer({
     },
 });
 
-// ==========================================
-// BULLMQ QUEUE
-// ==========================================
 const ingestionQueue = new Queue('ingestion-queue', { connection });
 
-// ==========================================
-// UPLOAD ENDPOINT
-// ==========================================
 app.post('/upload', upload.single('file'), async (req, res) => {
     if (!req.file) {
         return res.status(400).json({ error: 'Lütfen bir PDF dosyası yükleyin.' });
@@ -99,9 +97,6 @@ app.post('/upload', upload.single('file'), async (req, res) => {
     }
 });
 
-// ==========================================
-// STATUS ENDPOINT
-// ==========================================
 app.get('/documents/:id/status', async (req, res) => {
     const { id } = req.params;
     if (isNaN(parseInt(id, 10))) {
@@ -132,9 +127,6 @@ app.get('/documents/:id/status', async (req, res) => {
     }
 });
 
-// ==========================================
-// ASK ENDPOINT (Hybrid Search)
-// ==========================================
 app.post('/ask', async (req, res) => {
     const { question } = req.body;
     if (!question) {
@@ -142,7 +134,6 @@ app.post('/ask', async (req, res) => {
     }
 
     try {
-        // 1. Get question embedding from cache or Ollama
         let questionEmbedding = await getCachedEmbedding(question);
         let questionCacheHit = false;
 
@@ -158,7 +149,7 @@ app.post('/ask', async (req, res) => {
 
         const questionVector = `[${questionEmbedding.join(',')}]`;
 
-        // 2. Hybrid Search: Vector + Full-Text
+        // ── 2. Hibrit arama ──
         const searchResult = await pool.query(
             `WITH
               vector_search AS (
@@ -216,7 +207,7 @@ app.post('/ask', async (req, res) => {
             return res.status(400).json({ error: 'Veritabanında hiç chunk yok, önce bir doküman yükleyin.' });
         }
 
-        // 3. Threshold check
+        // ── 3. Context oluştur ──
         const bestScore = parseFloat(topChunks[0].hybrid_score);
         let contextText;
 
@@ -228,26 +219,120 @@ app.post('/ask', async (req, res) => {
 
         console.log(`[Ask] Hibrit arama tamamlandı. En yüksek skor: ${bestScore}`);
 
-        // 4. Send to LLM
-        const systemPrompt = `Sen yardımcı bir yapay zeka asistanısın. Sadece sana verilen aşağıdaki kaynaklara sadık kalarak soruyu cevapla.\n\n${contextText}`;
+        res.setHeader('Content-Type', 'text/event-stream');
+        res.setHeader('Cache-Control', 'no-cache');
+        res.setHeader('Connection', 'keep-alive');
+        res.setHeader('X-Accel-Buffering', 'no');
 
-        const chatResponse = await ollamaChat([
-            { role: 'system', content: systemPrompt },
-            { role: 'user', content: question },
-        ]);
-
-        res.json({
+        res.write(`event: metadata\n`);
+        res.write(`data: ${JSON.stringify({
             question,
             questionCacheHit,
             searchMode: 'hybrid',
             retrievedChunks: topChunks,
-            answer: chatResponse.message.content,
-        });
+            bestScore
+        })}\n\n`);
+
+        const systemPrompt = `Sen yardımcı bir yapay zeka asistanısın. Sadece sana verilen aşağıdaki kaynaklara sadık kalarak soruyu cevapla. Kaynaklar arasında birbiriyle alakasız olanlar olabilir, sadece soruyla ilgili olanı kullan. Eğer hiçbir kaynak sorunun cevabını içermiyorsa, kibarca 'Bu bilgi dökümanda yer almıyor' de.\n\n${contextText}`;
+
+        const stream = await ollamaChat([
+            { role: 'system', content: systemPrompt },
+            { role: 'user', content: question },
+        ]);
+
+        const reader = stream.getReader();
+        const decoder = new TextDecoder();
+
+        let fullAnswer = '';
+        let buffer = ''; // Tamamlanmamış JSON'ları biriktir
+
+        while (true) {
+            const { done, value } = await reader.read();
+            if (done) break;
+
+            const chunk = decoder.decode(value, { stream: true });
+            buffer += chunk;
+
+            // Satır satır parse et (Ollama her satırı ayrı JSON olarak gönderir)
+            const lines = buffer.split('\n');
+            buffer = lines.pop() || ''; // Son satır tamamlanmamış olabilir
+
+            for (const line of lines) {
+                const trimmed = line.trim();
+                if (!trimmed) continue;
+
+                try {
+                    const parsed = JSON.parse(trimmed);
+
+                    // Token varsa gönder
+                    if (parsed.message && parsed.message.content) {
+                        const token = parsed.message.content;
+                        fullAnswer += token;
+
+                        res.write(`event: token\n`);
+                        res.write(`data: ${JSON.stringify({ token })}\n\n`);
+
+                        // 🟢 Her token'dan sonra flush (önemli!)
+                        if (res.flush) res.flush();
+                    }
+
+                    // Stream bitti
+                    if (parsed.done) {
+                        break;
+                    }
+                } catch (e) {
+                    // JSON parse hatası - buffer'a ekle devam etsin
+                    console.warn('[SSE] Parse hatası, buffer\'a atılıyor:', trimmed.substring(0, 50));
+                }
+            }
+        }
+
+        // Kalan buffer'ı işle
+        if (buffer.trim()) {
+            try {
+                const parsed = JSON.parse(buffer.trim());
+                if (parsed.message && parsed.message.content) {
+                    const token = parsed.message.content;
+                    fullAnswer += token;
+                    res.write(`event: token\n`);
+                    res.write(`data: ${JSON.stringify({ token })}\n\n`);
+                }
+            } catch (e) {
+                // Son buffer parse edilemedi, görmezden gel
+            }
+        }
+
+        // ── 7. STREAM BİTİŞ ──
+        res.write(`event: done\n`);
+        res.write(`data: ${JSON.stringify({ fullAnswer, done: true })}\n\n`);
+        res.end();
 
     } catch (error) {
-        console.error('Soru cevaplama hatası:', error);
-        res.status(500).json({ error: 'Soru cevaplanırken hata oluştu.', details: error.message });
+        console.error('[Ask] Hata:', error);
+
+        // Eğer header'lar gönderildiyse SSE hatası gönder
+        if (!res.headersSent) {
+            return res.status(500).json({
+                error: 'Soru cevaplanırken hata oluştu.',
+                details: error.message
+            });
+        }
+
+        res.write(`event: error\n`);
+        res.write(`data: ${JSON.stringify({
+            error: 'Soru cevaplanırken hata oluştu.',
+            details: error.message
+        })}\n\n`);
+        res.end();
     }
+});
+
+// ==========================================
+// GLOBAL ERROR HANDLER
+// ==========================================
+app.use((err, req, res, next) => {
+    console.error('[Global Error]', err);
+    res.status(500).json({ error: 'Sunucu hatası', details: err.message });
 });
 
 const PORT = 3000;
